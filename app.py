@@ -1,326 +1,386 @@
 
-import time
-from datetime import datetime
-import numpy as np
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
 import yfinance as yf
+from datetime import datetime, timezone
+import math
 
-st.set_page_config(page_title="Calar AI Trader V4.1", page_icon="📈", layout="wide")
-st.markdown("<style>.block-container{padding:.7rem}.stButton button{width:100%;min-height:2.7rem}</style>", unsafe_allow_html=True)
+st.set_page_config(page_title="Calar AI Trader V5", page_icon="📈", layout="wide")
 
-SP500_URL="https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-FALLBACK="AAPL,AMD,AMZN,AVGO,BAC,CRWD,GOOGL,META,MSFT,MU,NVDA,PLTR,SNOW,TSLA,ZBRA"
+# =========================
+# CONFIG
+# =========================
+DEFAULT_TICKERS = (
+    "NVDA,AVGO,META,AMD,AMZN,GOOGL,MSFT,AAPL,TSLA,MU,CRWD,ANET,"
+    "PLTR,ORCL,APP,ARM,SNOW,ZBRA,SMCI,TSM,SPY,QQQ"
+)
+AUTO_REFRESH_MIN = 30
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_sp500():
+# =========================
+# DATA HELPERS
+# =========================
+@st.cache_data(ttl=1500, show_spinner=False)
+def get_data(ticker):
+    t = ticker.upper().strip()
+    h1 = yf.download(t, period="30d", interval="1h", auto_adjust=False, progress=False, threads=False)
+    m5 = yf.download(t, period="10d", interval="5m", auto_adjust=False, progress=False, threads=False)
+    return clean_ohlcv(h1), clean_ohlcv(m5)
+
+def clean_ohlcv(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    cols = {c: c.title() for c in df.columns}
+    df.rename(columns=cols, inplace=True)
+    needed = ["Open","High","Low","Close","Volume"]
+    for c in needed:
+        if c not in df.columns:
+            return pd.DataFrame()
+    return df[needed].dropna()
+
+def indicators(df):
+    x = df.copy()
+    x["EMA20"] = x["Close"].ewm(span=20, adjust=False).mean()
+    x["EMA50"] = x["Close"].ewm(span=50, adjust=False).mean()
+    delta = x["Close"].diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    x["RSI"] = 100 - (100 / (1 + rs))
+    tr = pd.concat([
+        x["High"]-x["Low"],
+        (x["High"]-x["Close"].shift()).abs(),
+        (x["Low"]-x["Close"].shift()).abs()
+    ], axis=1).max(axis=1)
+    x["ATR"] = tr.rolling(14).mean()
+    x["VolAvg20"] = x["Volume"].rolling(20).mean()
+    return x
+
+def candle_direction(row):
+    if row["Close"] > row["Open"]:
+        return "GREEN"
+    if row["Close"] < row["Open"]:
+        return "RED"
+    return "DOJI"
+
+def qqq_trend():
+    q1, q5 = get_data("QQQ")
+    if q1.empty:
+        return None
+    q = indicators(q1)
+    r = q.iloc[-1]
+    return {
+        "bull": r["Close"] > r["EMA20"] > r["EMA50"],
+        "bear": r["Close"] < r["EMA20"] < r["EMA50"],
+        "rsi": float(r["RSI"]) if pd.notna(r["RSI"]) else np.nan
+    }
+
+def five_min_confirmation(m5, side):
+    if m5.empty or len(m5) < 20:
+        return False, "Sin datos 5M suficientes"
+    x = indicators(m5)
+    last = x.iloc[-1]
+    prev = x.iloc[-2]
+    recent_high = x["High"].iloc[-8:-2].max()
+    recent_low = x["Low"].iloc[-8:-2].min()
+    if side == "CALL":
+        ok = last["Close"] > recent_high and last["Close"] > last["EMA20"]
+        return bool(ok), "Ruptura 5M confirmada" if ok else "Esperando ruptura 5M"
+    else:
+        ok = last["Close"] < recent_low and last["Close"] < last["EMA20"]
+        return bool(ok), "Ruptura 5M confirmada" if ok else "Esperando ruptura 5M"
+
+def analyze(ticker, qqq):
+    h1, m5 = get_data(ticker)
+    if h1.empty or len(h1) < 60:
+        return {"ticker": ticker, "status": "SIN DATOS", "side": "—"}
+
+    x = indicators(h1)
+    # IMPORTANT: only closed candles are used. Last candle can be incomplete,
+    # so use the two candles immediately before the latest bar.
+    c1 = x.iloc[-3]
+    c2 = x.iloc[-2]
+    last = x.iloc[-2]
+
+    d1, d2 = candle_direction(c1), candle_direction(c2)
+    price = float(last["Close"])
+    atr = float(last["ATR"]) if pd.notna(last["ATR"]) else price * 0.02
+    ema20, ema50 = float(last["EMA20"]), float(last["EMA50"])
+    rsi = float(last["RSI"]) if pd.notna(last["RSI"]) else 50
+    vol_ok = bool(last["Volume"] >= last["VolAvg20"]) if pd.notna(last["VolAvg20"]) else False
+
+    call_candle = d1 == "GREEN" and d2 == "GREEN"
+    put_candle = d1 == "RED" and d2 == "RED"
+
+    call_trend = price > ema20 > ema50
+    put_trend = price < ema20 < ema50
+    call_rsi = 55 <= rsi <= 70
+    put_rsi = 30 <= rsi <= 45
+    call_qqq = bool(qqq and qqq["bull"])
+    put_qqq = bool(qqq and qqq["bear"])
+
+    call_5m, call_5m_txt = five_min_confirmation(m5, "CALL")
+    put_5m, put_5m_txt = five_min_confirmation(m5, "PUT")
+
+    # Score is secondary. The two-candle rule is mandatory.
+    call_points = sum([
+        call_candle, call_trend, call_rsi, vol_ok, call_qqq, call_5m,
+        float(c2["Close"]) > float(c1["High"])
+    ])
+    put_points = sum([
+        put_candle, put_trend, put_rsi, vol_ok, put_qqq, put_5m,
+        float(c2["Close"]) < float(c1["Low"])
+    ])
+
+    # Strict signal: mandatory 1H candle pair + trend + QQQ + 5M confirmation.
+    call_signal = call_candle and call_trend and call_qqq and call_5m
+    put_signal = put_candle and put_trend and put_qqq and put_5m
+
+    side = "CALL" if call_signal else ("PUT" if put_signal else "NO OPERAR")
+    points = call_points if call_signal else (put_points if put_signal else max(call_points, put_points))
+    confidence = min(98, round(55 + points * 6))
+
+    # Practical target/stop based on ATR; not a guarantee.
+    if side == "CALL":
+        target = price + 1.5 * atr
+        stop = price - 1.0 * atr
+        setup = "🟢 CALL"
+    elif side == "PUT":
+        target = price - 1.5 * atr
+        stop = price + 1.0 * atr
+        setup = "🔴 PUT"
+    else:
+        target = np.nan
+        stop = np.nan
+        setup = "⏸ NO OPERAR"
+
+    return {
+        "ticker": ticker,
+        "status": "OK",
+        "side": side,
+        "setup": setup,
+        "price": price,
+        "candle1": d1,
+        "candle2": d2,
+        "ema20": ema20,
+        "ema50": ema50,
+        "rsi": rsi,
+        "volume_ok": vol_ok,
+        "qqq_ok": call_qqq if call_signal else put_qqq,
+        "confirm5m": call_5m if call_signal else put_5m,
+        "points": points,
+        "confidence": confidence if side != "NO OPERAR" else 0,
+        "target": target,
+        "stop": stop,
+        "atr": atr,
+        "call_points": call_points,
+        "put_points": put_points,
+        "five_txt": call_5m_txt if side != "PUT" else put_5m_txt,
+        "last_time": str(last.name),
+        "h1": x,
+        "m5": m5
+    }
+
+# =========================
+# OPTIONS
+# =========================
+@st.cache_data(ttl=900, show_spinner=False)
+def option_contracts(ticker):
     try:
-        t=next(x for x in pd.read_html(SP500_URL) if "Symbol" in x.columns)
-        return sorted(set(t["Symbol"].astype(str).str.replace(".","-",regex=False))),"Wikipedia / S&P 500"
+        tk = yf.Ticker(ticker)
+        expiries = tk.options
+        if not expiries:
+            return pd.DataFrame()
+        today = pd.Timestamp.now(tz=None).normalize()
+        rows = []
+        # Prefer expirations 21–60 days out.
+        selected = []
+        for e in expiries:
+            d = pd.Timestamp(e)
+            days = (d - today).days
+            if 21 <= days <= 60:
+                selected.append((e, days))
+        if not selected:
+            selected = [(e, (pd.Timestamp(e)-today).days) for e in expiries[:5]]
+        for e, days in selected[:6]:
+            chain = tk.option_chain(e)
+            for typ, df in [("CALL", chain.calls), ("PUT", chain.puts)]:
+                if df is None or df.empty:
+                    continue
+                z = df.copy()
+                z["type"] = typ
+                z["expiry"] = e
+                z["dte"] = days
+                rows.append(z)
+        return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
     except Exception:
-        return sorted(set(FALLBACK.split(","))),"Fallback"
+        return pd.DataFrame()
 
-def rsi(s,n=14):
-    d=s.diff()
-    up=d.clip(lower=0).ewm(alpha=1/n,adjust=False).mean()
-    dn=(-d.clip(upper=0)).ewm(alpha=1/n,adjust=False).mean()
-    return 100-100/(1+up/dn.replace(0,np.nan))
+def suggest_option(ticker, side, stock_price, target_price):
+    if side not in ("CALL","PUT"):
+        return None
+    df = option_contracts(ticker)
+    if df.empty:
+        return None
+    z = df[df["type"] == side].copy()
+    if z.empty:
+        return None
 
-def ind(df):
-    x=df.copy()
-    if isinstance(x.columns,pd.MultiIndex): x.columns=x.columns.get_level_values(0)
-    needed=["Open","High","Low","Close","Volume"]
-    if any(c not in x for c in needed): return pd.DataFrame()
-    for c in needed: x[c]=pd.to_numeric(x[c],errors="coerce")
-    x=x.dropna(subset=["Open","High","Low","Close"])
-    for n in [10,20,40,100,200]:
-        x[f"PM{n}"]=x.Close.rolling(n).mean()
-        x[f"EMA{n}"]=x.Close.ewm(span=n,adjust=False).mean()
-    x["RSI"]=rsi(x.Close)
-    prev=x.Close.shift(1)
-    tr=pd.concat([x.High-x.Low,(x.High-prev).abs(),(x.Low-prev).abs()],axis=1).max(axis=1)
-    x["ATR"]=tr.rolling(14).mean()
-    x["RVOL"]=x.Volume/x.Volume.rolling(20).mean()
-    x["ROC5"]=x.Close.pct_change(5)*100
-    x["ROC20"]=x.Close.pct_change(20)*100
-    x["H20"]=x.High.rolling(20).max().shift(1)
-    x["L20"]=x.Low.rolling(20).min().shift(1)
-    x["RET1"]=x.Close.pct_change()*100
-    return x.dropna()
+    z["dist"] = (z["strike"] - stock_price).abs()
+    # Prefer near-ATM, 21–45 DTE, usable liquidity and nonzero bid/ask.
+    z["dte_pref"] = (z["dte"] - 30).abs()
+    z["liq"] = z["openInterest"].fillna(0) + z["volume"].fillna(0)
+    z["spread"] = (z["ask"] - z["bid"]).replace([np.inf,-np.inf], np.nan)
 
-def candles(df):
-    if len(df)<5:return []
-    x=df
-    def v(i):
-        r=x.iloc[i]; o,h,l,c=map(float,[r.Open,r.High,r.Low,r.Close])
-        body=abs(c-o); rng=max(h-l,1e-9)
-        return o,h,l,c,body,rng,h-max(o,c),min(o,c)-l
-    o,h,l,c,b,r,u,d=v(-1); out=[]
-    if d>=2*b and u<=.6*b and b/r<=.45: out.append("Martillo")
-    if u>=2*b and d<=.6*b and b/r<=.45: out.append("Estrella fugaz")
-    o1,h1,l1,c1,b1,r1,u1,d1=v(-2)
-    if c1<o1 and c>o and c>=o1 and o<=c1: out.append("Envolvente alcista")
-    if c1>o1 and c<o and o>=c1 and c<=o1: out.append("Envolvente bajista")
-    if b/r<=.10: out.append("Doji")
-    return list(dict.fromkeys(out))
+    # Basic liquidity filter.
+    candidates = z[(z["dte"] >= 21) & (z["dte"] <= 45) & (z["liq"] >= 10)].copy()
+    if candidates.empty:
+        candidates = z.copy()
+    candidates["score"] = (
+        candidates["dist"] / max(stock_price, 1)
+        + candidates["dte_pref"] / 100
+        - np.log1p(candidates["liq"]) / 100
+    )
+    row = candidates.sort_values("score").iloc[0]
+    mid = np.nan
+    if pd.notna(row.get("bid")) and pd.notna(row.get("ask")):
+        mid = (float(row["bid"]) + float(row["ask"])) / 2
+    elif pd.notna(row.get("lastPrice")):
+        mid = float(row["lastPrice"])
 
-@st.cache_data(ttl=300,show_spinner=False)
-def batch(symbols,period="6mo",interval="1d"):
-    out={}
-    for i in range(0,len(symbols),80):
-        part=symbols[i:i+80]
-        try:
-            d=yf.download(part,period=period,interval=interval,auto_adjust=False,progress=False,group_by="ticker",threads=True)
-            if isinstance(d.columns,pd.MultiIndex):
-                for t in part:
-                    try:
-                        z=d[t].dropna()
-                        if not z.empty: out[t]=z
-                    except: pass
-            elif len(part)==1 and not d.empty: out[part[0]]=d.dropna()
-        except: pass
-        time.sleep(.05)
-    return out
+    # For a simple educational estimate, show stock target and contract BE.
+    strike = float(row["strike"])
+    be = strike + mid if side == "CALL" and pd.notna(mid) else (
+        strike - mid if side == "PUT" and pd.notna(mid) else np.nan
+    )
+    return {
+        "expiry": row["expiry"], "dte": int(row["dte"]), "strike": strike,
+        "bid": row.get("bid", np.nan), "ask": row.get("ask", np.nan),
+        "mid": mid, "breakeven": be, "open_interest": row.get("openInterest", 0),
+        "volume": row.get("volume", 0)
+    }
 
-@st.cache_data(ttl=300,show_spinner=False)
-def optchain(t):
-    try:
-        tk=yf.Ticker(t); rows=[]
-        for e in list(tk.options or [])[:10]:
-            try:
-                q=tk.option_chain(e)
-                for typ,z in [("CALL",q.calls),("PUT",q.puts)]:
-                    if z is not None and not z.empty:
-                        a=z.copy(); a["type"]=typ; a["expiration"]=e; rows.append(a)
-            except: pass
-        return pd.concat(rows,ignore_index=True) if rows else pd.DataFrame()
-    except: return pd.DataFrame()
+# =========================
+# UI
+# =========================
+st.title("📈 Calar AI Trader V5")
+st.caption("Motor de confirmación 1H + 5M • CALL/PUT • filtro de mercado • sugerencia de contrato")
 
-def score(df,bench=None,intra=None):
-    x=ind(df)
-    if len(x)<40:return None
-    r=x.iloc[-1]; call=50.; put=50.; ce=[]; pe=[]
-    # Trend
-    for ok,n,a,b in [
-        (r.Close>r.PM10,6,"Precio > PM10","Precio < PM10"),
-        (r.PM10>r.PM20,8,"PM10 > PM20","PM10 < PM20"),
-        (r.PM20>r.PM40,7,"PM20 > PM40","PM20 < PM40"),
-        (r.Close>r.PM100,6,"Precio > PM100","Precio < PM100"),
-        (r.Close>r.PM200,6,"Precio > PM200","Precio < PM200")]:
-        (ce if ok else pe).append(a if ok else b); call+=n if ok else 0; put+=0 if ok else n
-    # Recent momentum gets strong weight
-    if r.ROC5>2: call+=7; ce.append(f"ROC5 +{r.ROC5:.1f}%")
-    if r.ROC5<-2: put+=7; pe.append(f"ROC5 {r.ROC5:.1f}%")
-    if r.ROC20>5: call+=7; ce.append(f"ROC20 +{r.ROC20:.1f}%")
-    if r.ROC20<-5: put+=7; pe.append(f"ROC20 {r.ROC20:.1f}%")
-    if 55<=r.RSI<=70: call+=6; ce.append(f"RSI {r.RSI:.1f}")
-    if 30<=r.RSI<=45: put+=6; pe.append(f"RSI {r.RSI:.1f}")
-    if r.RSI>75: call-=5; ce.append("RSI sobrecomprado: penalización")
-    if r.RSI<25: put-=5; pe.append("RSI sobrevendido: penalización")
-    # Volume
-    if r.RVOL>=1.5:
-        if r.Close>r.PM10: call+=7; ce.append(f"RVOL {r.RVOL:.2f}x")
-        if r.Close<r.PM10: put+=7; pe.append(f"RVOL {r.RVOL:.2f}x")
-    # Breakout / breakdown
-    if r.Close>r.H20: call+=10; ce.append("Ruptura máximo 20D")
-    if r.Close<r.L20: put+=10; pe.append("Ruptura mínimo 20D")
-    # Benchmark
-    if bench is not None and not bench.empty:
-        b=ind(bench)
-        if not b.empty:
-            q=b.iloc[-1]
-            if q.Close>q.PM20: call+=5; ce.append("QQQ > PM20")
-            else: put+=5; pe.append("QQQ < PM20")
-    # Candles
-    for p in candles(x):
-        if p in ["Martillo","Envolvente alcista"]: call+=4; ce.append(p)
-        elif p in ["Estrella fugaz","Envolvente bajista"]: put+=4; pe.append(p)
-    # Intraday confirmation: critical, not optional for an ENTRY
-    intraday_ok=False
-    if intra is not None and not intra.empty:
-        y=ind(intra)
-        if not y.empty:
-            q=y.iloc[-1]
-            intraday_ok=True
-            if q.Close>q.PM10: call+=8; ce.append("Intraday > PM10")
-            else: put+=8; pe.append("Intraday < PM10")
-            if q.PM10>q.PM20: call+=7; ce.append("Intraday PM10 > PM20")
-            else: put+=7; pe.append("Intraday PM10 < PM20")
-            if q.RVOL>=1.3:
-                if q.Close>q.PM10: call+=5; ce.append(f"Intraday RVOL {q.RVOL:.2f}x")
-                elif q.Close<q.PM10: put+=5; pe.append(f"Intraday RVOL {q.RVOL:.2f}x")
-            for p in candles(y):
-                if p in ["Martillo","Envolvente alcista"]: call+=3; ce.append("Intraday "+p)
-                elif p in ["Estrella fugaz","Envolvente bajista"]: put+=3; pe.append("Intraday "+p)
-    call=float(np.clip(call,0,100)); put=float(np.clip(put,0,100))
-    gap=call-put
-    if call>=80 and gap>=15 and intraday_ok: signal="🟢 CALL — GATILLO CONFIRMADO"
-    elif put>=80 and gap<=-15 and intraday_ok: signal="🔴 PUT — GATILLO CONFIRMADO"
-    elif call>=70 and gap>=10: signal="🟢 CALL — VIGILAR"
-    elif put>=70 and gap<=-10: signal="🔴 PUT — VIGILAR"
-    else: signal="🟡 NO OPERAR"
-    return dict(call=call,put=put,signal=signal,price=float(r.Close),rsi=float(r.RSI),rvol=float(r.RVOL),atr=float(r.ATR),data=x,ce=ce,pe=pe)
-
-def option_candidates(ch,spot,direction):
-    if ch.empty:return pd.DataFrame()
-    z=ch.copy(); z["expiration"]=pd.to_datetime(z.expiration)
-    z["DTE"]=(z.expiration-pd.Timestamp.now().normalize()).dt.days
-    z=z[(z.DTE>=14)&(z.DTE<=60)&(z.type==direction)].copy()
-    if z.empty:return z
-    z["mid"]=(z.bid.fillna(0)+z.ask.fillna(0))/2
-    z["spread_pct"]=np.where(z.mid>0,(z.ask-z.bid)/z.mid*100,np.nan)
-    z["dist_pct"]=(z.strike-spot).abs()/spot*100
-    delta=z.delta.abs() if "delta" in z else pd.Series(np.nan,index=z.index)
-    z["liq_score"]=np.log1p(z.volume.fillna(0))*7+np.log1p(z.openInterest.fillna(0))*5-z.spread_pct.clip(0,100)*.7
-    z["contract_score"]=z.liq_score+np.where(delta.between(.45,.65),15,0)+np.where(z.dist_pct<=7,8,0)
-    cols=["contractSymbol","expiration","DTE","strike","bid","ask","mid","volume","openInterest","impliedVolatility","delta","gamma","theta","vega","spread_pct","contract_score"]
-    return z.sort_values("contract_score",ascending=False)[[c for c in cols if c in z]].head(15)
-
-def target_model(price,atr,direction):
-    # Educational scenario targets, not guaranteed outcomes.
-    move=max(atr*1.5,price*0.015)
-    if direction=="CALL":
-        entry=price; target=price+move; stop=price-max(atr*1.0,price*.01)
-    else:
-        entry=price; target=price-move; stop=price+max(atr*1.0,price*.01)
-    return entry,target,stop
-
-def select_contract(q,spot,direction):
-    if q.empty:return None
-    # Prefer delta 0.45-0.65, DTE 21-45, tight spread, reasonable distance.
-    z=q.copy()
-    z["delta_abs"]=z.delta.abs() if "delta" in z else np.nan
-    z["fit"]=np.where(z.delta_abs.between(.45,.65),20,0)+np.where(z.DTE.between(21,45),15,0)+np.where(z.dist_pct<=7,10,0)-z.spread_pct.fillna(100).clip(0,100)
-    return z.sort_values("fit",ascending=False).iloc[0]
-
-def contract_scenario(row,price,target,stop,direction):
-    if row is None:return None
-    premium=float(row.mid) if pd.notna(row.mid) else np.nan
-    delta=float(row.delta) if "delta" in row and pd.notna(row.delta) else np.nan
-    if not np.isfinite(premium) or premium<=0:return None
-    if not np.isfinite(delta): return dict(entry=premium,target=np.nan,stop=np.nan,roi=np.nan)
-    # Linear delta approximation for a scenario only.
-    if direction=="CALL":
-        target_p=premium+max(0,target-price)*abs(delta)
-        stop_p=max(0,premium-max(0,price-stop)*abs(delta))
-    else:
-        target_p=premium+max(0,price-target)*abs(delta)
-        stop_p=max(0,premium-max(0,stop-price)*abs(delta))
-    roi=(target_p-premium)/premium*100 if premium else np.nan
-    return dict(entry=premium,target=target_p,stop=stop_p,roi=roi)
-
-# ---------------- UI ----------------
-syms,source=get_sp500()
-st.title("📈 CALAR AI TRADER V4.1")
-st.caption("Motor de confirmación: tendencia + momentum + estructura + volumen + intradía + opciones")
+st.info(
+    "REGLA V5: CALL exige 2 velas verdes consecutivas cerradas en 1H. "
+    "PUT exige 2 velas rojas consecutivas cerradas en 1H. "
+    "Después exige tendencia EMA20/EMA50, confirmación de QQQ y ruptura en 5M. "
+    "Si no se cumplen, el sistema dice NO OPERAR."
+)
 
 with st.sidebar:
-    full=st.checkbox("Analizar S&P 500 completo",True)
-    if full: selected=syms
-    else:
-        txt=st.text_area("Tickers","NVDA,CRWD,AMD,SNOW,AMZN,META,MSFT,GOOGL,TSLA,MU,AVGO,PLTR,ZBRA")
-        selected=[x.strip().upper() for x in txt.split(",") if x.strip()]
-    period=st.selectbox("Histórico diario",["6mo","1y","2y"],1)
-    topn=st.slider("Confirmación intradía Top N",20,100,50,10)
+    st.header("⚙️ Configuración")
+    tickers_text = st.text_area("Acciones a revisar", DEFAULT_TICKERS, height=150)
+    tickers = [x.strip().upper() for x in tickers_text.replace(";", ",").split(",") if x.strip()]
+    st.write(f"**{len(tickers)} símbolos**")
+    if st.button("🔄 Actualizar ahora", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
     st.divider()
-    st.markdown("**TradingView:** usa la importación CSV si quieres contrastar datos exportados de tu gráfico. TradingView no ofrece una API general de datos de cuenta; los webhooks sirven para alertas, no para extraer toda la cuenta.")
-    tv=st.file_uploader("CSV de TradingView (opcional)",type=["csv"])
+    st.write("**Revisión automática:** cada 30 minutos")
+    st.write("Usa siempre velas 1H cerradas; no toma decisiones con la vela 1H todavía abierta.")
 
-scan=st.button("🔄 ESCANEAR V4.1",type="primary",use_container_width=True)
+# Automatic refresh every 30 minutes.
+# The user can also force a refresh with the sidebar button.
+try:
+    from streamlit_autorefresh import st_autorefresh
+    st_autorefresh(interval=30 * 60 * 1000, key="calar_v5_refresh")
+except Exception:
+    pass
 
-if scan:
-    bench=batch(["QQQ"],period,"1d").get("QQQ",pd.DataFrame())
-    daily=batch(selected,period,"1d")
-    rows=[]; details={}
-    prog=st.progress(0)
-    for i,t in enumerate(selected):
-        try:
-            d=daily.get(t)
-            if d is not None and not d.empty:
-                s=score(d,bench)
-                if s:
-                    rows.append([t,s["call"],s["put"],s["signal"],s["price"],s["rsi"],s["rvol"]])
-                    details[t]=s
-        except: pass
-        prog.progress((i+1)/max(1,len(selected)))
-    prog.empty()
-    rank=pd.DataFrame(rows,columns=["Ticker","CALL","PUT","Señal","Precio","RSI","RVOL"])
-    rank["Score"]=rank[["CALL","PUT"]].max(axis=1)
-    rank=rank.sort_values(["Score","CALL","PUT"],ascending=False)
-
-    finalists=rank.head(min(topn,len(rank))).Ticker.tolist()
-    intra=batch(finalists,"5d","5m")
-    for t in finalists:
-        if t in details and t in intra:
+if "results" not in st.session_state or st.button("▶️ Ejecutar análisis"):
+    with st.spinner("Analizando mercado 1H + 5M..."):
+        qqq = qqq_trend()
+        results = []
+        for t in tickers:
             try:
-                s=score(daily[t],bench,intra[t]); details[t]=s
-                rank.loc[rank.Ticker==t,["CALL","PUT","Señal","Precio","RSI","RVOL"]]=[s["call"],s["put"],s["signal"],s["price"],s["rsi"],s["rvol"]]
-            except: pass
-    rank["Score"]=rank[["CALL","PUT"]].max(axis=1)
-    rank=rank.sort_values(["Score","CALL","PUT"],ascending=False)
-
-    st.subheader("🏆 Ranking V4.1")
-    st.dataframe(rank.head(100),use_container_width=True,hide_index=True)
-    a,b,c=st.columns(3)
-    with a:
-        st.subheader("🟢 CALL")
-        st.dataframe(rank[rank.Señal.str.contains("CALL")].head(10),use_container_width=True,hide_index=True)
-    with b:
-        st.subheader("🔴 PUT")
-        st.dataframe(rank[rank.Señal.str.contains("PUT")].head(10),use_container_width=True,hide_index=True)
-    with c:
-        st.subheader("🟡 NO OPERAR")
-        st.dataframe(rank[rank.Señal.str.contains("NO OPERAR")].head(10),use_container_width=True,hide_index=True)
-
-    actionable=rank[rank.Señal.str.contains("GATILLO CONFIRMADO")]
-    best=actionable.iloc[0].Ticker if not actionable.empty else rank.iloc[0].Ticker
-    s=details[best]
-    direction="CALL" if s["call"]>s["put"] else "PUT"
-    st.subheader(f"🎯 {best} — {s['signal']}")
-    m=st.columns(5)
-    m[0].metric("CALL",f"{s['call']:.0f}/100"); m[1].metric("PUT",f"{s['put']:.0f}/100")
-    m[2].metric("Precio",f"${s['price']:.2f}"); m[3].metric("RSI",f"{s['rsi']:.1f}"); m[4].metric("RVOL",f"{s['rvol']:.2f}x")
-    with st.expander("🧠 Evidencia alcista",True):
-        for x in s["ce"]: st.write("✅",x)
-    with st.expander("🧠 Evidencia bajista",True):
-        for x in s["pe"]: st.write("🔻",x)
-    st.line_chart(s["data"][["Close","PM10","PM20","PM40","PM100","PM200"]].tail(180))
-
-    q=option_candidates(optchain(best),s["price"],direction)
-    st.subheader(f"🎯 Contrato candidato para simulación — {direction}")
-    if q.empty:
-        st.warning("No se encontró una cadena compatible.")
-    else:
-        chosen=select_contract(q,s["price"],direction)
-        entry,target,stop=target_model(s["price"],s["atr"],direction)
-        scenario=contract_scenario(chosen,s["price"],target,stop,direction)
-        show=q.copy()
-        st.dataframe(show,use_container_width=True,hide_index=True)
-        if chosen is not None:
-            st.markdown("### 📌 Escenario del contrato")
-            cc=st.columns(6)
-            cc[0].metric("Strike",f"{chosen.strike:g}")
-            cc[1].metric("DTE",f"{int(chosen.DTE)}")
-            cc[2].metric("Delta",f"{chosen.delta:.2f}" if pd.notna(chosen.delta) else "N/D")
-            cc[3].metric("Prima mid",f"${chosen.mid:.2f}")
-            cc[4].metric("Objetivo acción",f"${target:.2f}")
-            cc[5].metric("Stop acción",f"${stop:.2f}")
-            if scenario:
-                st.info(f"Prima objetivo aproximada (modelo lineal de Delta): **${scenario['target']:.2f}** · prima stop aproximada: **${scenario['stop']:.2f}** · retorno teórico del escenario: **{scenario['roi']:.1f}%**.")
-            st.caption("Estos objetivos son escenarios matemáticos, no una garantía de ganancia. La aproximación lineal por Delta no modela IV, gamma, theta, spread ni cambios de volatilidad.")
-    st.download_button("⬇️ Descargar ranking",rank.to_csv(index=False).encode(),f"calar_v41_{datetime.now():%Y%m%d_%H%M}.csv","text/csv")
+                results.append(analyze(t, qqq))
+            except Exception as e:
+                results.append({"ticker": t, "status": f"ERROR: {e}", "side": "—"})
+        st.session_state.results = results
 else:
-    st.info("Pulsa ESCANEAR V4.1 para ejecutar el análisis.")
-    st.markdown("""
-### V4.1 — Correcciones clave
-- No convierte una tendencia de fondo en una entrada automática.
-- El **gatillo intradía** es obligatorio para una señal “GATILLO CONFIRMADO”.
-- Penaliza sobrecompra/sobreventa.
-- Aumenta el peso de momentum y estructura reciente.
-- CALL y PUT son independientes.
-- Incluye **NO OPERAR** cuando no hay ventaja clara.
-- Selecciona un contrato candidato por DTE, Delta, liquidez, spread y distancia.
-- Calcula un **escenario de objetivo/stop de la acción** y una aproximación de prima usando Delta.
-- Permite importar un CSV exportado de TradingView para contraste manual.
+    results = st.session_state.results
+
+valid = [r for r in results if r.get("status") == "OK"]
+
+if valid:
+    table = []
+    for r in valid:
+        table.append({
+            "Ticker": r["ticker"],
+            "Señal V5": r["setup"],
+            "Precio": round(r["price"], 2),
+            "1H": f'{r["candle1"]} + {r["candle2"]}',
+            "EMA20/50": "OK" if ((r["side"]=="CALL" and r["ema20"]>r["ema50"]) or (r["side"]=="PUT" and r["ema20"]<r["ema50"])) else "NO",
+            "RSI": round(r["rsi"], 1),
+            "Volumen": "OK" if r["volume_ok"] else "NO",
+            "QQQ": "OK" if r["qqq_ok"] else "NO",
+            "5M": "OK" if r["confirm5m"] else "ESPERAR",
+            "Score": r["points"],
+            "Confianza setup": f'{r["confidence"]}/100' if r["side"] != "NO OPERAR" else "—",
+        })
+    df_table = pd.DataFrame(table)
+    # Put confirmed signals first.
+    df_table["_sort"] = df_table["Señal V5"].map(lambda x: 0 if "CALL" in x or "PUT" in x else 1)
+    df_table = df_table.sort_values(["_sort","Score"], ascending=[True,False]).drop(columns="_sort")
+    st.subheader("🔎 Escáner V5")
+    st.dataframe(df_table, use_container_width=True, hide_index=True)
+
+    confirmed = [r for r in valid if r["side"] in ("CALL","PUT")]
+    if confirmed:
+        st.subheader("🏆 Señales confirmadas")
+        for r in sorted(confirmed, key=lambda a: a["confidence"], reverse=True)[:5]:
+            with st.container(border=True):
+                c1,c2,c3,c4 = st.columns(4)
+                c1.metric("Setup", r["setup"])
+                c2.metric("Confianza del setup", f'{r["confidence"]}/100')
+                c3.metric("Precio acción", f'${r["price"]:.2f}')
+                c4.metric("Objetivo acción", f'${r["target"]:.2f}')
+                st.write(
+                    f'**{r["ticker"]}** — 1H: {r["candle1"]} + {r["candle2"]} | '
+                    f'RSI {r["rsi"]:.1f} | EMA20 {r["ema20"]:.2f} / EMA50 {r["ema50"]:.2f} | '
+                    f'5M: {r["five_txt"]}'
+                )
+                st.write(f'**Stop técnico aproximado:** ${r["stop"]:.2f}  •  **ATR 1H:** ${r["atr"]:.2f}')
+                opt = suggest_option(r["ticker"], r["side"], r["price"], r["target"])
+                if opt:
+                    st.write(
+                        f'**Contrato orientativo:** {r["side"]} strike **${opt["strike"]:.0f}**, '
+                        f'expira **{opt["expiry"]}** ({opt["dte"]} DTE). '
+                        f'Bid/Ask: ${opt["bid"]:.2f} / ${opt["ask"]:.2f}.'
+                    )
+                    if pd.notna(opt["breakeven"]):
+                        st.write(f'**Break-even aproximado al vencimiento:** ${opt["breakeven"]:.2f}')
+                else:
+                    st.warning("No se pudo obtener una cadena de opciones suficientemente líquida para sugerir contrato.")
+
+                st.caption(
+                    "El strike es una referencia técnica, no una garantía de ganancia. "
+                    "La prima puede caer aunque la acción suba por IV, theta, spread y tiempo."
+                )
+    else:
+        st.warning("V5 no encuentra ninguna señal que cumpla TODOS los filtros. Esto es intencional: NO FORZAR una operación.")
+
+st.divider()
+st.subheader("📌 Cómo interpretar V5")
+st.markdown("""
+- **CALL confirmado:** 2 velas 1H verdes cerradas + tendencia alcista + QQQ alcista + ruptura 5M.
+- **PUT confirmado:** 2 velas 1H rojas cerradas + tendencia bajista + QQQ bajista + ruptura 5M.
+- **NO OPERAR:** falta una confirmación. V5 no inventa una señal para llenar el ranking.
+- **Objetivo/stop:** se calculan con ATR 1H para crear un escenario de salida; no son predicciones.
+- **Revisión:** puedes pulsar **Actualizar ahora** o dejar la página abierta para refrescar cada 30 minutos si tu versión de Streamlit soporta el fragmento automático.
 """)
-    st.warning("Esta aplicación es un analizador/escenario educativo. Los datos de Yahoo Finance pueden tener retrasos y las opciones cambian rápidamente.")
+
+st.caption(
+    f"Calar AI Trader V5 • Datos proporcionados por Yahoo Finance mediante yfinance • "
+    f"Última ejecución: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+)
