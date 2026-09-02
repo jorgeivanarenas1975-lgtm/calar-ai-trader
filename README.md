@@ -1,6 +1,4 @@
-# Calar AI Trader V6 - Streamlit Interface
-
-Versión con interfaz visual integrada para solucionar la pantalla en blanco:
-- Panel interactivo en Streamlit.
-- Carga de archivos CSV de mercado.
-- Detección automática de 2 velas verdes (CALL) y 2 velas rojas (PUT) en 1H con filtros de EMA 50 y volumen.
+# Calar AI Trader V7
+Escáner educativo 1H + 5M para acciones.
+Incluye EMA20/50/200, RSI, ADX, volumen relativo, rupturas,
+dos velas consecutivas, contexto SPY/QQQ, ranking y CSV.
