@@ -20,10 +20,7 @@ def analizar_velas_1h(df):
     df['dos_rojas'] = (df['color_vela'] == -1) & (df['color_vela'].shift(1) == -1)
     
     # 5. Filtros de calidad añadidos:
-    # - Señal CALL: 2 velas verdes + Precio por encima de la EMA 50 + Volumen de la última vela mayor al promedio
     df['senal_call'] = df['dos_verdes'] & (df['close'] > df['ema_50']) & (df['volume'] > df['vol_ma'])
-    
-    # - Señal PUT: 2 velas rojas + Precio por debajo de la EMA 50 + Volumen de la última vela mayor al promedio
     df['senal_put'] = df['dos_rojas'] & (df['close'] < df['ema_50']) & (df['volume'] > df['vol_ma'])
     
     return df
